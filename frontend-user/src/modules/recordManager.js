@@ -21,6 +21,10 @@ export class RecordManager {
       const data = localStorage.getItem(this.STORAGE_KEY);
       if (data) {
         const records = JSON.parse(data);
+        if (!Array.isArray(records)) {
+          logger.warn('存储的记录数据格式无效，已忽略');
+          return [];
+        }
         logger.info('加载记录成功', { count: records.length });
         return records;
       }
@@ -32,6 +36,7 @@ export class RecordManager {
 
   /**
    * 保存记录到 localStorage
+   * 失败时抛出带明确原因的错误
    */
   saveRecords() {
     try {
@@ -39,7 +44,43 @@ export class RecordManager {
       logger.info('保存记录成功', { count: this.records.length });
     } catch (error) {
       logger.error('保存记录失败', error);
-      throw new Error('保存记录失败，存储空间可能已满');
+      if (this.isQuotaExceededError(error)) {
+        throw new Error('存储空间已满，记录未保存。请删除部分历史记录或清理浏览器存储后重试');
+      }
+      const reason = error && error.message ? error.message : '未知原因';
+      throw new Error(`保存记录失败：${reason}`);
+    }
+  }
+
+  /**
+   * 判断是否为存储空间不足错误
+   * @param {*} error - 捕获的错误
+   * @returns {boolean} 是否为配额超限错误
+   */
+  isQuotaExceededError(error) {
+    if (!error) return false;
+    return (
+      error.name === 'QuotaExceededError' ||
+      error.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      error.code === 22 || // 旧版浏览器 QUOTA_EXCEEDED_ERR
+      error.code === 1014 // 旧版 Firefox NS_ERROR_DOM_QUOTA_REACHED
+    );
+  }
+
+  /**
+   * 事务式提交：先变更内存数据再写入存储，
+   * 写入失败时回滚到变更前的状态，保证内存与存储始终一致
+   * @param {Function} mutate - 对 this.records 的变更操作
+   */
+  commit(mutate) {
+    const snapshot = this.records.slice();
+    try {
+      mutate();
+      this.saveRecords();
+    } catch (error) {
+      this.records = snapshot;
+      logger.warn('写入失败，已回滚到变更前状态', { count: snapshot.length });
+      throw error;
     }
   }
 
@@ -54,9 +95,15 @@ export class RecordManager {
    * @param {Object} recordData.harmonicIntensities - 倍频强度
    * @param {Object} recordData.analysisResult - 完整分析结果
    * @param {string} recordData.name - 记录名称（可选）
+   * @param {string} recordData.note - 备注（可选）
    * @returns {Object} 创建的记录
    */
   createRecord(recordData) {
+    if (this.records.length >= this.MAX_RECORDS) {
+      logger.warn('创建记录被拒绝：已达数量上限', { count: this.records.length });
+      throw new Error(`记录数量已达上限（${this.MAX_RECORDS} 条），请先删除部分记录后再保存`);
+    }
+
     const record = {
       id: this.generateId(),
       name: recordData.name || `${recordData.fileName} - ${this.formatTimestamp()}`,
@@ -69,16 +116,12 @@ export class RecordManager {
       harmonicIntensities: recordData.harmonicIntensities,
       analysisResult: recordData.analysisResult,
       createdAt: Date.now(),
-      note: ''
+      note: recordData.note || ''
     };
 
-    this.records.unshift(record);
-
-    if (this.records.length > this.MAX_RECORDS) {
-      this.records = this.records.slice(0, this.MAX_RECORDS);
-    }
-
-    this.saveRecords();
+    this.commit(() => {
+      this.records.unshift(record);
+    });
     logger.info('创建新记录', { id: record.id, name: record.name });
 
     return record;
@@ -114,8 +157,9 @@ export class RecordManager {
       return null;
     }
 
-    this.records[index] = { ...this.records[index], ...updates };
-    this.saveRecords();
+    this.commit(() => {
+      this.records[index] = { ...this.records[index], ...updates };
+    });
     logger.info('更新记录', { id });
 
     return this.records[index];
@@ -133,8 +177,9 @@ export class RecordManager {
       return false;
     }
 
-    this.records.splice(index, 1);
-    this.saveRecords();
+    this.commit(() => {
+      this.records.splice(index, 1);
+    });
     logger.info('删除记录', { id });
 
     return true;
@@ -144,8 +189,9 @@ export class RecordManager {
    * 清空所有记录
    */
   clearAllRecords() {
-    this.records = [];
-    this.saveRecords();
+    this.commit(() => {
+      this.records = [];
+    });
     logger.info('清空所有记录');
   }
 
@@ -220,36 +266,55 @@ export class RecordManager {
   }
 
   /**
-   * 导入记录
+   * 导入记录（整体原子操作：全部成功或全部不导入）
    * @param {string} jsonData - JSON 字符串
    * @returns {number} 导入的记录数量
    */
   importRecords(jsonData) {
+    let data;
     try {
-      const data = JSON.parse(jsonData);
-      const records = Array.isArray(data) ? data : [data];
-      let count = 0;
-
-      for (const record of records) {
-        if (this.validateRecord(record)) {
-          record.id = this.generateId();
-          record.createdAt = Date.now();
-          this.records.unshift(record);
-          count++;
-        }
-      }
-
-      if (this.records.length > this.MAX_RECORDS) {
-        this.records = this.records.slice(0, this.MAX_RECORDS);
-      }
-
-      this.saveRecords();
-      logger.info('导入记录', { count });
-      return count;
+      data = JSON.parse(jsonData);
     } catch (error) {
-      logger.error('导入记录失败', error);
+      logger.error('导入记录失败：JSON 解析错误', error);
       throw new Error('导入记录失败，数据格式无效');
     }
+
+    const records = Array.isArray(data) ? data : [data];
+    if (records.length === 0) {
+      return 0;
+    }
+
+    const invalidCount = records.filter(r => !this.validateRecord(r)).length;
+    if (invalidCount > 0) {
+      logger.warn('导入记录被拒绝：存在无效记录', { invalidCount });
+      throw new Error(`导入记录失败，${invalidCount} 条记录数据格式无效`);
+    }
+
+    const available = this.MAX_RECORDS - this.records.length;
+    if (records.length > available) {
+      logger.warn('导入记录被拒绝：超出数量上限', {
+        current: this.records.length,
+        importing: records.length,
+        available
+      });
+      throw new Error(
+        `导入记录失败，当前已有 ${this.records.length} 条记录，最多还可导入 ${available} 条` +
+        `（本次共 ${records.length} 条），请先删除部分记录`
+      );
+    }
+
+    const now = Date.now();
+    const prepared = records.map(record => ({
+      ...record,
+      id: this.generateId(),
+      createdAt: now
+    }));
+
+    this.commit(() => {
+      this.records = [...prepared, ...this.records];
+    });
+    logger.info('导入记录', { count: prepared.length });
+    return prepared.length;
   }
 
   /**
