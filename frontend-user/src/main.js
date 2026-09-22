@@ -349,7 +349,7 @@ class App {
     const harmonicIntensities = this.extractHarmonicIntensities(this.currentAnalysisResult);
 
     try {
-      const record = this.recordManager.createRecord({
+      this.recordManager.createRecord({
         fileName: this.currentFileName,
         startMs,
         endMs,
@@ -357,12 +357,9 @@ class App {
         harmonics: this.currentAnalysisResult.harmonics,
         harmonicIntensities,
         analysisResult: this.currentAnalysisResult,
-        name: name
+        name: name,
+        note: note
       });
-
-      if (note) {
-        this.recordManager.updateRecord(record.id, { note });
-      }
 
       this.uiController.showToast('记录保存成功', 'success');
       this.updateRecordsList();
@@ -570,13 +567,18 @@ class App {
     if (!this.selectedRecordId) return;
 
     if (confirm('确定要删除这条记录吗？此操作不可恢复。')) {
-      const success = this.recordManager.deleteRecord(this.selectedRecordId);
-      if (success) {
-        this.updateRecordsList();
-        this.closeRecordModal();
-        this.uiController.showToast('记录已删除', 'success');
-      } else {
-        this.uiController.showToast('删除失败', 'error');
+      try {
+        const success = this.recordManager.deleteRecord(this.selectedRecordId);
+        if (success) {
+          this.updateRecordsList();
+          this.closeRecordModal();
+          this.uiController.showToast('记录已删除', 'success');
+        } else {
+          this.uiController.showToast('删除失败：未找到该记录', 'error');
+        }
+      } catch (error) {
+        // 写入存储失败时记录未被删除，列表与详情保持原状，仅提示失败原因
+        this.uiController.showToast(error.message, 'error');
       }
     }
   }
